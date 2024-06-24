@@ -332,7 +332,15 @@ function VGAScreen(cpu, bus, vga_memory_size)
 
     io.register_read(0x3CC, this, this.port3CC_read);
 
-    io.register_write_consecutive(0x3D4, this, this.port3D4_write, this.port3D5_write);
+    io.register_write(0x3D4, this, this.port3D4_write, value => {
+        this.port3D4_write(value & 0xFF);
+        this.port3D5_write(value >> 8 & 0xFF);
+    });
+    io.register_write(0x3D5, this, this.port3D5_write, value => {
+        dbg_log("16-bit write to 3D5: " + h(value, 4), LOG_VGA);
+        this.port3D5_write(value & 0xFF);
+    });
+
     io.register_read(0x3D4, this, this.port3D4_read);
     io.register_read(0x3D5, this, this.port3D5_read, () => {
         dbg_log("Warning: 16-bit read from 3D5", LOG_VGA);
@@ -846,10 +854,13 @@ VGAScreen.prototype.text_mode_redraw = function()
 {
     var addr = this.start_address << 1,
         chr,
+        blinking,
         color;
 
     const split_screen_row = this.scan_line_to_screen_row(this.line_compare);
     const row_offset = Math.max(0, (this.offset_register * 2 - this.max_cols) * 2);
+    const blink_flag = this.attribute_mode & 1 << 3;
+    const bg_color_mask = blink_flag ? 7 : 0xF;
 
     for(var row = 0; row < this.max_rows; row++)
     {
@@ -862,9 +873,10 @@ VGAScreen.prototype.text_mode_redraw = function()
         {
             chr = this.vga_memory[addr];
             color = this.vga_memory[addr | 1];
+            blinking = blink_flag && (color & 1 << 7);
 
-            this.bus.send("screen-put-char", [row, col, chr,
-                this.vga256_palette[this.dac_mask & this.dac_map[color >> 4 & 0xF]],
+            this.bus.send("screen-put-char", [row, col, chr, blinking,
+                this.vga256_palette[this.dac_mask & this.dac_map[color >> 4 & bg_color_mask]],
                 this.vga256_palette[this.dac_mask & this.dac_map[color & 0xF]]]);
 
             addr += 2;
@@ -916,9 +928,12 @@ VGAScreen.prototype.vga_memory_write_text_mode = function(addr, value)
         chr = value;
         color = this.vga_memory[addr | 1];
     }
+    const blink_flag = this.attribute_mode & 1 << 3;
+    const blinking = blink_flag && (color & 1 << 7);
+    const bg_color_mask = blink_flag ? 7 : 0xF;
 
-    this.bus.send("screen-put-char", [row, col, chr,
-        this.vga256_palette[this.dac_mask & this.dac_map[color >> 4 & 0xF]],
+    this.bus.send("screen-put-char", [row, col, chr, blinking,
+        this.vga256_palette[this.dac_mask & this.dac_map[color >> 4 & bg_color_mask]],
         this.vga256_palette[this.dac_mask & this.dac_map[color & 0xF]]]);
 };
 
@@ -941,9 +956,7 @@ VGAScreen.prototype.update_cursor = function()
 
     dbg_assert(row >= 0 && col >= 0);
 
-    row = Math.min(this.max_rows - 1, row);
-    col = Math.min(this.max_cols - 1, col);
-
+    // NOTE: is allowed to be out of bounds
     this.bus.send("screen-update-cursor", [row, col]);
 };
 
@@ -1352,7 +1365,12 @@ VGAScreen.prototype.update_vertical_retrace = function()
 
 VGAScreen.prototype.update_cursor_scanline = function()
 {
-    this.bus.send("screen-update-cursor-scanline", [this.cursor_scanline_start, this.cursor_scanline_end]);
+    const disabled = this.cursor_scanline_start & 0x20;
+    const max = this.max_scan_line & 0x1F;
+    const start = Math.min(max, this.cursor_scanline_start & 0x1F);
+    const end = Math.min(max, this.cursor_scanline_end & 0x1F);
+    const visible = !disabled && start < end;
+    this.bus.send("screen-update-cursor-scanline", [start, end, visible]);
 };
 
 /**
@@ -1840,6 +1858,7 @@ VGAScreen.prototype.port3D5_write = function(value)
                 this.update_vga_size();
             }
 
+            this.update_cursor_scanline();
             this.update_layers();
             break;
         case 0xA:
